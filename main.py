@@ -11,6 +11,7 @@ Pipeline Steps:
   2. Resample to target interval at start (skipped if interval is 1m).
   3. Validate OHLCV data integrity & continuity.
   4. Compute 53 technical indicators & derived features (drops warmup by default).
+  5. Validate post-feature dataset (missing candles, duplicate timestamps, NaNs, indicator calculations).
 """
 
 import argparse
@@ -25,7 +26,7 @@ from src.config import PARQUET_DIR, PROCESSED_DIR
 from src.indicators import compute_all_indicators
 from src.resampling import resample_ohlcv
 from src.storage import csv_to_parquet, load_parquet
-from src.validation import validate_ohlcv
+from src.validation import validate_features, validate_ohlcv
 
 
 def parse_args():
@@ -73,47 +74,57 @@ def main():
             print(f"Error: Neither {parquet_1m.name} nor {input_csv.resolve()} found.", file=sys.stderr)
             print("Please run 'merger.py' first.", file=sys.stderr)
             sys.exit(1)
-        print("\n[1/4] Converting CSV to 1m Parquet...")
+        print("\n[1/5] Converting CSV to 1m Parquet...")
         csv_to_parquet(csv_path=input_csv, parquet_path=parquet_1m)
     else:
-        print(f"\n[1/4] Found base Parquet: {parquet_1m.name} ({parquet_1m.stat().st_size / (1024 * 1024):.1f} MB)")
+        print(f"\n[1/5] Found base Parquet: {parquet_1m.name} ({parquet_1m.stat().st_size / (1024 * 1024):.1f} MB)")
 
     # -------------------------------------------------------------
     # Step 2: Resampling (At Start if interval != 1m)
     # -------------------------------------------------------------
     if interval != "1m":
         parquet_interval = PARQUET_DIR / f"{pair}_{interval}.parquet"
-        print(f"\n[2/4] Resampling base 1m data to {interval} at start...")
+        print(f"\n[2/5] Resampling base 1m data to {interval} at start...")
         df_1m = load_parquet(parquet_1m)
         working_df = resample_ohlcv(df_1m, target_timeframe=interval)
         working_df.to_parquet(parquet_interval, compression="snappy", engine="pyarrow")
         print(f"  -> Resampled to {len(working_df):,} candles.")
         print(f"  -> Saved: {parquet_interval.name}")
     else:
-        print("\n[2/4] Interval is 1m. Resampling skipped.")
+        print("\n[2/5] Interval is 1m. Resampling skipped.")
         working_df = load_parquet(parquet_1m)
 
     # -------------------------------------------------------------
     # Step 3: Data Quality & Integrity Validation
     # -------------------------------------------------------------
-    print(f"\n[3/4] Validating {pair} ({interval}) data...")
+    print(f"\n[3/5] Validating {pair} ({interval}) OHLCV data...")
     val_start = time.time()
     report = validate_ohlcv(working_df, interval=interval)
     print(report.summary())
-    print(f"Validation completed in {time.time() - val_start:.2f}s.")
+    print(f"OHLCV validation completed in {time.time() - val_start:.2f}s.")
 
     # -------------------------------------------------------------
     # Step 4: Technical Indicators & Feature Addition (Warmup Dropped)
     # -------------------------------------------------------------
-    print(f"\n[4/4] Computing Technical Indicators for {pair} ({interval})...")
+    print(f"\n[4/5] Computing Technical Indicators for {pair} ({interval})...")
     features_df = compute_all_indicators(
         df=working_df,
         drop_warmup=True,
         warmup_period=200,
     )
 
+    # -------------------------------------------------------------
+    # Step 5: Post-Feature Engineering Validation
+    # (Missing candles, duplicate timestamps, NaNs, indicator calculations)
+    # -------------------------------------------------------------
+    print(f"\n[5/5] Validating {pair} ({interval}) Engineered Features & Indicators...")
+    feat_val_start = time.time()
+    feature_report = validate_features(features_df, interval=interval)
+    print(feature_report.summary())
+    print(f"Feature validation completed in {time.time() - feat_val_start:.2f}s.")
+
     output_features_parquet = PARQUET_DIR / f"{pair}_{interval}_features.parquet"
-    print(f"Writing features to: {output_features_parquet.name}...")
+    print(f"\nWriting features to: {output_features_parquet.name}...")
     features_df.to_parquet(output_features_parquet, compression="snappy", engine="pyarrow")
     size_mb = output_features_parquet.stat().st_size / (1024 * 1024)
 
@@ -128,6 +139,8 @@ def main():
     print(f" Output Dataset:       {output_features_parquet.name}")
     print(f" Rows (Post-Warmup):   {len(features_df):,}")
     print(f" Columns:              {len(features_df.columns)} (11 OHLCV + 53 Indicators)")
+    print(f" OHLCV Status:         {'PASSED [OK]' if report.is_valid else 'FAILED [WARNINGS FOUND]'}")
+    print(f" Feature Status:       {'PASSED [OK]' if feature_report.is_valid else 'FAILED [WARNINGS FOUND]'}")
     print(f" File Size:            {size_mb:.2f} MB")
     print(f" Saved Location:       {output_features_parquet.resolve()}")
     print("=" * 68 + "\n")

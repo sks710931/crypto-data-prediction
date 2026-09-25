@@ -1,3 +1,10 @@
+# Environment & Secrets
+.env
+.env.*
+
+# Output directories
+jev_results/
+*_results/
 # Virtual environment
 .venv/
 venv/
