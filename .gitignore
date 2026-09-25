@@ -1,0 +1,33 @@
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Data folders (raw zip files and large processed CSVs)
+raw/
+processed/
+*.zip
+*.csv
+
+# Python cache & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# Temporary / scratch files
+*.tmp
+*.log
+
+# IDE & Editor settings
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
