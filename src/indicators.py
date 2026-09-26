@@ -15,6 +15,7 @@ import numpy as np
 import pandas as pd
 import pandas_ta as ta
 
+from .config import TIMEFRAME_SECONDS, TRAIN_DATA_DIR
 from .storage import load_parquet
 
 
@@ -205,8 +206,8 @@ def add_volume_indicators(df: pd.DataFrame) -> pd.DataFrame:
     # RVOL & Volume Z-Score (20)
     vol_mean_20 = volume.rolling(window=20).mean()
     vol_std_20 = volume.rolling(window=20).std()
-    res["rvol_20"] = volume / (vol_mean_20 + 1e-10)
-    res["volume_zscore_20"] = (volume - vol_mean_20) / (vol_std_20 + 1e-10)
+    res["rvol_20"] = volume / vol_mean_20.where(vol_mean_20 != 0)
+    res["volume_zscore_20"] = (volume - vol_mean_20) / vol_std_20.where(vol_std_20 != 0)
 
     # OBV
     res["obv"] = ta.obv(close, volume)
@@ -224,7 +225,7 @@ def add_volume_indicators(df: pd.DataFrame) -> pd.DataFrame:
     for w in [20, 60]:
         pv_sum = price_volume.rolling(window=w).sum()
         v_sum = volume.rolling(window=w).sum()
-        vwap = pv_sum / (v_sum + 1e-10)
+        vwap = pv_sum / v_sum.where(v_sum != 0)
         res[f"vwap_{w}"] = vwap
         res[f"dist_vwap_{w}_pct"] = (close - vwap) / vwap * 100.0
 
@@ -239,6 +240,7 @@ def compute_all_indicators(
     df: pd.DataFrame,
     drop_warmup: bool = True,
     warmup_period: int = 200,
+    interval: str = "1m",
 ) -> pd.DataFrame:
     """
     Computes all 4 families of technical indicators and joins them with base OHLCV data.
@@ -251,34 +253,50 @@ def compute_all_indicators(
     Returns:
       DataFrame containing base OHLCV + all engineered features.
     """
+    if interval not in TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    if not df.open_time.is_monotonic_increasing or df.open_time.duplicated().any():
+        raise ValueError("Candles must have unique, increasing open_time values")
+    if (df.open_time % TIMEFRAME_SECONDS[interval] != 0).any():
+        raise ValueError("Candles must be aligned to the requested interval")
+
     start_time = time.time()
     print("Computing technical indicators across 4 categories...")
+    step = TIMEFRAME_SECONDS[interval]
+    starts = np.r_[0, np.flatnonzero(np.diff(df.open_time.to_numpy()) != step) + 1]
+    ends = np.r_[starts[1:], len(df)]
+    next_open = df.open_time.shift(-1)
+    next_candle_open = df.open.shift(-1)
+    next_candle_close = df.close.shift(-1)
+    label_valid = (next_open - df.open_time == step) & (next_candle_close != next_candle_open)
+    labels = pd.Series((next_candle_close > next_candle_open).astype("int8"), index=df.index).astype("Int8")
+    labels.loc[~label_valid] = pd.NA
 
-    t0 = time.time()
-    df_trend = add_trend_indicators(df)
-    print(f"  [1/4] Trend indicators computed ({len(df_trend.columns)} features) in {time.time() - t0:.2f}s.")
-
-    t0 = time.time()
-    df_mom = add_momentum_indicators(df)
-    print(f"  [2/4] Momentum indicators computed ({len(df_mom.columns)} features) in {time.time() - t0:.2f}s.")
-
-    t0 = time.time()
-    df_vol = add_volatility_indicators(df)
-    print(f"  [3/4] Volatility indicators computed ({len(df_vol.columns)} features) in {time.time() - t0:.2f}s.")
-
-    t0 = time.time()
-    df_volm = add_volume_indicators(df)
-    print(f"  [4/4] Volume indicators computed ({len(df_volm.columns)} features) in {time.time() - t0:.2f}s.")
-
-    # Combine all feature blocks with original OHLCV columns
-    features_df = pd.concat([df, df_trend, df_mom, df_vol, df_volm], axis=1)
-
-    if drop_warmup and len(features_df) > warmup_period:
-        features_df = features_df.iloc[warmup_period:].reset_index(drop=True)
-        print(f"Dropped {warmup_period} warmup rows. Remaining rows: {len(features_df):,}")
-
-    total_features = len(features_df.columns) - len(df.columns)
-    print(f"Feature engineering complete: {total_features} new features added in {time.time() - start_time:.2f}s.")
+    blocks = []
+    dropped = 0
+    for start, end in zip(starts, ends):
+        segment = df.iloc[start:end].reset_index(drop=True)
+        if drop_warmup and len(segment) <= warmup_period:
+            dropped += len(segment)
+            continue
+        trend = add_trend_indicators(segment)
+        momentum = add_momentum_indicators(segment)
+        volatility = add_volatility_indicators(segment)
+        volume = add_volume_indicators(segment)
+        block = pd.concat([segment, trend, momentum, volatility, volume], axis=1)
+        block["target_next_up"] = pd.array(labels.iloc[start:end].to_numpy(), dtype="Int8")
+        if drop_warmup:
+            block = block.iloc[warmup_period:]
+            dropped += warmup_period
+        blocks.append(block)
+    if not blocks:
+        raise ValueError("No segment contains enough candles to pass the warmup period")
+    features_df = pd.concat(blocks, ignore_index=True)
+    features_df.attrs["warmup_rows_dropped"] = dropped
+    features_df.attrs["segment_count"] = len(starts)
+    print(f"Segments: {len(starts):,}; explicitly excluded warmup rows: {dropped:,}.")
+    total_features = len(features_df.columns) - len(df.columns) - 1
+    print(f"Feature engineering complete: {total_features} new features and one target in {time.time() - start_time:.2f}s.")
     return features_df
 
 
@@ -287,6 +305,7 @@ def generate_and_save_features(
     output_parquet: Optional[Path | str] = None,
     drop_warmup: bool = True,
     warmup_period: int = 200,
+    interval: str = "1m",
 ) -> Path:
     """
     Loads OHLCV Parquet file, computes all technical indicators, and saves to Parquet.
@@ -297,7 +316,7 @@ def generate_and_save_features(
 
     if output_parquet is None:
         # e.g., BTCUSDT_5m_features.parquet
-        output_parquet = input_parquet.parent / f"{input_parquet.stem}_features.parquet"
+        output_parquet = TRAIN_DATA_DIR / f"{input_parquet.stem}_features.parquet"
     else:
         output_parquet = Path(output_parquet)
 
@@ -309,6 +328,7 @@ def generate_and_save_features(
         df=df,
         drop_warmup=drop_warmup,
         warmup_period=warmup_period,
+        interval=interval,
     )
 
     print(f"Writing features to: {output_parquet.name}...")

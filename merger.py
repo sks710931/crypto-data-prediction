@@ -8,9 +8,9 @@ processed/{pair}.csv.
 
 import argparse
 import csv
-import glob
+from contextlib import ExitStack
 import io
-import os
+import json
 import re
 import sys
 import time
@@ -34,6 +34,7 @@ HEADER = [
     "taker_buy_quote_asset_volume",
     "ignore",
 ]
+SYNTHETIC_COLUMN = "is_synthetic"
 
 INTERVAL_SECONDS = {
     "1s": 1,
@@ -67,9 +68,7 @@ def parse_interval_to_seconds(interval_str: str) -> int:
         multipliers = {"s": 1, "m": 60, "h": 3600, "d": 86400}
         return val * multipliers[unit]
 
-    # Fallback default 1m
-    print(f"Warning: Unknown interval '{interval_str}', defaulting to 60 seconds (1m).")
-    return 60
+    raise ValueError(f"Unknown interval '{interval_str}'")
 
 
 def to_seconds(ts_val: str | int | float) -> int:
@@ -78,7 +77,7 @@ def to_seconds(ts_val: str | int | float) -> int:
     Handles nanoseconds (19 digits), microseconds (16 digits),
     milliseconds (13 digits), and seconds (10 digits).
     """
-    ts = int(float(ts_val))
+    ts = int(ts_val)
     if ts >= 10**17:  # Nanoseconds (~1e18)
         return ts // 10**9
     elif ts >= 10**14:  # Microseconds (~1e15)
@@ -103,24 +102,7 @@ def extract_year_month_from_filename(filename: str) -> tuple[int, int]:
 
 def get_sorted_zip_files(raw_dir: Path, pair: str, interval: str) -> list[Path]:
     """Find and chronologically sort all zip files for the pair."""
-    patterns = [
-        f"{pair}-{interval}-*.zip",
-        f"{pair}-*.zip",
-        "*.zip",
-    ]
-
-    files: set[Path] = set()
-    for pattern in patterns:
-        matched = list(raw_dir.glob(pattern))
-        if matched:
-            files.update(matched)
-            break
-
-    if not files:
-        # Check case-insensitive
-        for f in raw_dir.iterdir():
-            if f.suffix.lower() == ".zip" and pair.lower() in f.name.lower():
-                files.add(f)
+    files = set(raw_dir.glob(f"{pair}-{interval}-*.zip"))
 
     # Sort files chronologically by extracted year-month and name
     sorted_files = sorted(
@@ -130,6 +112,24 @@ def get_sorted_zip_files(raw_dir: Path, pair: str, interval: str) -> list[Path]:
     return sorted_files
 
 
+def synthetic_gap_rows(previous_ts: int, next_ts: int, step_seconds: int, previous_close: str):
+    """Yield marked flat placeholders; the price and zero activity are synthetic."""
+    for ts in range(previous_ts + step_seconds, next_ts, step_seconds):
+        yield [
+            str(ts), previous_close, previous_close, previous_close, previous_close,
+            "0", str(ts + step_seconds - 1), "0", "0", "0", "0", "0", "1",
+        ]
+
+
+def clock_grid_exclusion_reason(open_ts: int, close_ts: int, step_seconds: int) -> str | None:
+    """Explain why a source candle cannot occupy a complete UTC clock slot."""
+    if open_ts % step_seconds:
+        return "unaligned_open_time"
+    if close_ts - open_ts != step_seconds - 1:
+        return "irregular_duration"
+    return None
+
+
 def merge_and_validate(
     pair: str,
     raw_dir: Path,
@@ -137,7 +137,12 @@ def merge_and_validate(
     interval_str: str = "1m",
     fill_missing: bool = False,
     include_header: bool = True,
+    clock_grid: bool = False,
 ):
+    if clock_grid and not fill_missing:
+        raise ValueError("--clock-grid requires --fill-missing")
+    if fill_missing and not include_header:
+        raise ValueError("--fill-missing requires a header so synthetic rows remain identifiable")
     step_seconds = parse_interval_to_seconds(interval_str)
 
     if not raw_dir.exists():
@@ -151,6 +156,8 @@ def merge_and_validate(
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     temp_output_file = output_file.with_suffix(".tmp")
+    exceptions_path = output_file.with_suffix(".excluded_source.csv")
+    temp_exceptions = exceptions_path.with_suffix(".csv.tmp")
 
     print("=" * 70)
     print(f" Binance Klines Merger & Validator")
@@ -162,19 +169,35 @@ def merge_and_validate(
     print("=" * 70)
 
     total_rows = 0
+    observed_rows = 0
+    synthetic_rows = 0
+    excluded_source_rows = 0
     duplicate_count = 0
+    misaligned_count = 0
+    irregular_duration_count = 0
     gaps: list[dict] = []
     prev_open_ts: int | None = None
-    prev_close_price: str = "0.0"
+    prev_row: list[str] | None = None
+    prev_source_open_ts: int | None = None
+    prev_source_row: list[str] | None = None
+    prev_close_price: str | None = None
+    previous_archive: str | None = None
     first_open_ts: int | None = None
     last_open_ts: int | None = None
+    fills: list[dict] = []
 
     start_time = time.time()
 
-    with open(temp_output_file, "w", newline="", encoding="utf-8") as out_f:
+    with ExitStack() as stack:
+        out_f = stack.enter_context(open(temp_output_file, "w", newline="", encoding="utf-8"))
         writer = csv.writer(out_f)
+        exceptions_writer = None
+        if clock_grid:
+            exceptions_f = stack.enter_context(open(temp_exceptions, "w", newline="", encoding="utf-8"))
+            exceptions_writer = csv.writer(exceptions_f)
+            exceptions_writer.writerow(HEADER + ["reason", "source_archive"])
         if include_header:
-            writer.writerow(HEADER)
+            writer.writerow(HEADER + ([SYNTHETIC_COLUMN] if fill_missing else []))
 
         for file_idx, zip_path in enumerate(zip_files, start=1):
             print(f"Processing [{file_idx:3d}/{len(zip_files):3d}]: {zip_path.name}...", end="\r", flush=True)
@@ -196,23 +219,43 @@ def merge_and_validate(
                             # Check if header row
                             try:
                                 open_ts_sec = to_seconds(row[0])
-                            except (ValueError, IndexError):
-                                # Skip header row if present in CSV
-                                continue
+                            except (ValueError, IndexError) as exc:
+                                if row[0].strip().lower() == "open_time":
+                                    continue
+                                raise ValueError(f"Malformed timestamp in {zip_path.name}: {row!r}") from exc
+
+                            if len(row) != len(HEADER):
+                                raise ValueError(f"Expected {len(HEADER)} fields in {zip_path.name}, found {len(row)}: {row!r}")
 
                             # Convert close_time (column 6) if present
                             if len(row) > 6:
                                 try:
                                     close_ts_sec = to_seconds(row[6])
                                     row[6] = str(close_ts_sec)
-                                except ValueError:
-                                    row[6] = str(open_ts_sec + step_seconds - 1)
+                                except ValueError as exc:
+                                    raise ValueError(f"Malformed close_time in {zip_path.name}: {row!r}") from exc
                             else:
                                 close_ts_sec = open_ts_sec + step_seconds - 1
 
                             row[0] = str(open_ts_sec)
-                            close_price = row[4] if len(row) > 4 else prev_close_price
-
+                            if prev_source_open_ts is not None:
+                                if open_ts_sec < prev_source_open_ts:
+                                    raise ValueError(f"Out of order source timestamp {prev_source_open_ts} -> {open_ts_sec} in {zip_path.name}")
+                                if open_ts_sec == prev_source_open_ts:
+                                    if row != prev_source_row:
+                                        raise ValueError(f"Conflicting duplicate source candle at {open_ts_sec} in {zip_path.name}")
+                                    duplicate_count += 1
+                                    continue
+                            prev_source_open_ts = open_ts_sec
+                            prev_source_row = row.copy()
+                            misaligned_count += int(open_ts_sec % step_seconds != 0)
+                            irregular_duration_count += int(close_ts_sec - open_ts_sec != step_seconds - 1)
+                            reason = clock_grid_exclusion_reason(open_ts_sec, close_ts_sec, step_seconds)
+                            if clock_grid and reason is not None:
+                                assert exceptions_writer is not None
+                                exceptions_writer.writerow(row + [reason, zip_path.name])
+                                excluded_source_rows += 1
+                                continue
                             if first_open_ts is None:
                                 first_open_ts = open_ts_sec
 
@@ -222,57 +265,79 @@ def merge_and_validate(
 
                                 if diff == 0:
                                     # Duplicate timestamp
+                                    if row != prev_row:
+                                        raise ValueError(f"Conflicting duplicate candle at {open_ts_sec} in {zip_path.name}")
                                     duplicate_count += 1
                                     continue
                                 elif diff < 0:
-                                    print(f"\n[WARNING] Out of order timestamp detected: {prev_open_ts} -> {open_ts_sec} in {zip_path.name}")
+                                    raise ValueError(f"Out of order timestamp {prev_open_ts} -> {open_ts_sec} in {zip_path.name}")
                                 elif diff > step_seconds:
-                                    missing_candles = (diff // step_seconds) - 1
+                                    missing_candles = (diff - 1) // step_seconds
                                     gap_info = {
+                                        "previous_observed_ts": prev_open_ts,
+                                        "next_observed_ts": open_ts_sec,
                                         "start_ts": prev_open_ts + step_seconds,
-                                        "end_ts": open_ts_sec - step_seconds,
+                                        "end_ts": prev_open_ts + missing_candles * step_seconds,
                                         "start_utc": format_utc(prev_open_ts + step_seconds),
-                                        "end_utc": format_utc(open_ts_sec - step_seconds),
+                                        "end_utc": format_utc(prev_open_ts + missing_candles * step_seconds),
                                         "missing_candles": missing_candles,
                                         "duration_sec": diff - step_seconds,
+                                        "boundary_residual_sec": diff - missing_candles * step_seconds,
                                     }
                                     gaps.append(gap_info)
-
                                     if fill_missing:
-                                        # Fill missing rows with forward fill
-                                        curr_fill_ts = prev_open_ts + step_seconds
-                                        while curr_fill_ts < open_ts_sec:
-                                            fill_row = [
-                                                str(curr_fill_ts),          # open_time
-                                                prev_close_price,           # open
-                                                prev_close_price,           # high
-                                                prev_close_price,           # low
-                                                prev_close_price,           # close
-                                                "0.00000000",               # volume
-                                                str(curr_fill_ts + step_seconds - 1),  # close_time
-                                                "0.00000000",               # quote_asset_volume
-                                                "0",                        # number_of_trades
-                                                "0.00000000",               # taker_buy_base_asset_volume
-                                                "0.00000000",               # taker_buy_quote_asset_volume
-                                                "0",                        # ignore
-                                            ]
-                                            writer.writerow(fill_row)
+                                        assert prev_close_price is not None
+                                        for synthetic in synthetic_gap_rows(prev_open_ts, open_ts_sec, step_seconds, prev_close_price):
+                                            writer.writerow(synthetic)
+                                            synthetic_rows += 1
                                             total_rows += 1
-                                            curr_fill_ts += step_seconds
+                                        fills.append({
+                                            **gap_info,
+                                            "synthetic_rows_inserted": missing_candles,
+                                            "price_source": "previous observed close",
+                                            "volume_and_trades": "synthetic zero",
+                                            "source_archive_before": previous_archive,
+                                            "source_archive_after": zip_path.name,
+                                        })
 
                             # Write validated row
-                            # Ensure row has 12 columns
-                            while len(row) < 12:
-                                row.append("0")
-
-                            writer.writerow(row[:12])
+                            writer.writerow(row + (["0"] if fill_missing else []))
                             total_rows += 1
+                            observed_rows += 1
                             prev_open_ts = open_ts_sec
-                            prev_close_price = close_price
+                            prev_row = row.copy()
+                            prev_close_price = row[4]
+                            previous_archive = zip_path.name
                             last_open_ts = open_ts_sec
 
     # Rename temp file to final destination
     temp_output_file.replace(output_file)
+    if clock_grid:
+        temp_exceptions.replace(exceptions_path)
+    if fill_missing:
+        report_path = output_file.with_suffix(".fill_report.json")
+        report = {
+            "pair": pair,
+            "interval": interval_str,
+            "source": str(raw_dir.resolve()),
+            "output_csv": str(output_file.resolve()),
+            "synthetic_column": SYNTHETIC_COLUMN,
+            "clock_grid": clock_grid,
+            "observed_rows": observed_rows,
+            "excluded_source_rows": excluded_source_rows,
+            "excluded_source_csv": str(exceptions_path.resolve()) if clock_grid else None,
+            "synthetic_rows": synthetic_rows,
+            "total_rows": total_rows,
+            "gap_intervals_filled": len(fills),
+            "off_grid_observed_rows": misaligned_count,
+            "irregular_observed_durations": irregular_duration_count,
+            "nonuniform_gap_boundaries": sum(g["boundary_residual_sec"] != step_seconds for g in fills),
+            "fills": fills,
+            "warning": "Synthetic rows are placeholders, not observed trades. Exclude them from model training and indicator state.",
+        }
+        temp_report = report_path.with_suffix(".json.tmp")
+        temp_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        temp_report.replace(report_path)
     elapsed = time.time() - start_time
     file_size_mb = output_file.stat().st_size / (1024 * 1024)
 
@@ -281,15 +346,23 @@ def merge_and_validate(
     print(f"  - Output File:       {output_file.resolve()}")
     print(f"  - Output File Size:  {file_size_mb:.2f} MB")
     print(f"  - Total Candles:     {total_rows:,}")
+    if fill_missing:
+        print(f"  - Observed Candles:  {observed_rows:,}")
+        print(f"  - Synthetic Candles: {synthetic_rows:,}")
+        if clock_grid:
+            print(f"  - Excluded Source:   {excluded_source_rows:,} (saved to {exceptions_path.resolve()})")
+        print(f"  - Filling Report:    {report_path.resolve()}")
     if first_open_ts and last_open_ts:
         print(f"  - Start Time:        {format_utc(first_open_ts)} ({first_open_ts}s)")
         print(f"  - End Time:          {format_utc(last_open_ts)} ({last_open_ts}s)")
     print(f"  - Duplicates:        {duplicate_count}")
+    print(f"  - Misaligned Opens:  {misaligned_count:,}")
+    print(f"  - Irregular Durations:{irregular_duration_count:,}")
     print(f"  - Timestamp Format:  Seconds (Validated)")
     print(f"  - Gaps Detected:     {len(gaps)}")
 
     total_missing_candles = sum(g["missing_candles"] for g in gaps)
-    print(f"  - Missing Candles:   {total_missing_candles:,}")
+    print(f"  - Gap Slots Found:   {total_missing_candles:,}")
     print(f"  - Elapsed Time:      {elapsed:.2f}s")
     print("=" * 70)
 
@@ -302,7 +375,7 @@ def merge_and_validate(
             print(f"{idx:<4} {g['start_utc']:<22} {g['end_utc']:<22} {g['missing_candles']:<16,d} {dur_str:<12}")
 
         if len(gaps) > 10:
-            print(f"... and {len(gaps) - 10} more gaps (typically Binance maintenance windows).")
+            print(f"... and {len(gaps) - 10} more gaps (cause not inferred).")
         print("-" * 78)
     else:
         print("\n[Validation Success] Perfect timestamp continuity! No missing timestamps.")
@@ -345,7 +418,12 @@ def main():
     parser.add_argument(
         "--fill-missing",
         action="store_true",
-        help="Fill missing candle gaps with previous close price and zero volume",
+        help="Insert marked synthetic flat candles and write a .fill_report.json; unsuitable as observed training data",
+    )
+    parser.add_argument(
+        "--clock-grid",
+        action="store_true",
+        help="For fill mode, put only aligned, full-duration source bars on the uniform grid and save source exceptions separately",
     )
     parser.add_argument(
         "--no-header",
@@ -376,6 +454,7 @@ def main():
         interval_str=interval,
         fill_missing=args.fill_missing,
         include_header=not args.no_header,
+        clock_grid=args.clock_grid,
     )
 
 

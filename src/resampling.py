@@ -17,6 +17,7 @@ def resample_ohlcv(
     df: pd.DataFrame,
     target_timeframe: str,
     drop_incomplete_last: bool = True,
+    return_excluded: bool = False,
 ) -> pd.DataFrame:
     """
     Resamples 1-minute OHLCV DataFrame into a higher timeframe (e.g., '5m', '15m', '1h').
@@ -36,14 +37,24 @@ def resample_ohlcv(
         raise ValueError(
             f"Unsupported timeframe '{target_timeframe}'. Supported: {list(TIMEFRAME_MAP.keys())}"
         )
+    if not drop_incomplete_last:
+        raise ValueError("Incomplete candles cannot enter a training dataset")
 
     pandas_freq = TIMEFRAME_MAP[target_timeframe]
     target_seconds = TIMEFRAME_SECONDS[target_timeframe]
+    if target_seconds <= 60 or target_seconds % 60:
+        raise ValueError("Target timeframe must contain whole 1m candles")
 
     # Create temporary UTC datetime index for accurate resampling
     temp_df = df.copy()
     temp_df["dt"] = pd.to_datetime(temp_df["open_time"], unit="s", utc=True)
     temp_df.set_index("dt", inplace=True)
+    temp_df["source_valid"] = (
+        (temp_df["open_time"] % 60 == 0)
+        & (temp_df["close_time"] - temp_df["open_time"] == 59)
+    )
+    if "is_synthetic" in temp_df:
+        temp_df["source_valid"] &= ~temp_df["is_synthetic"].astype(bool)
 
     agg_dict = {
         "open": "first",
@@ -65,21 +76,35 @@ def resample_ohlcv(
 
     # Resample with left-closed, left-labeled intervals: [T, T + interval)
     resampled = temp_df.resample(pandas_freq, closed="left", label="left").agg(agg_dict)
-
-    # Drop intervals with zero observations (exchange maintenance / gaps)
-    resampled.dropna(subset=["close"], inplace=True)
+    source_groups = temp_df.resample(pandas_freq, closed="left", label="left")
+    counts = source_groups["open_time"].count()
+    first = source_groups["open_time"].min()
+    last = source_groups["open_time"].max()
+    unique = source_groups["open_time"].nunique()
+    source_valid = source_groups["source_valid"].all()
+    # Pandas can retain second-resolution datetime indexes; their int64 values
+    # are already seconds, so do not assume nanoseconds here.
+    starts = resampled.index.tz_localize(None).astype("datetime64[s]").astype("int64")
+    complete = (
+        (counts == target_seconds // 60)
+        & (unique == target_seconds // 60)
+        & (first == starts)
+        & (last == starts + target_seconds - 60)
+        & source_valid
+    )
+    excluded_mask = ((counts > 0) & ~complete).to_numpy()
+    excluded = pd.DataFrame({
+        "open_time": starts.to_numpy()[excluded_mask],
+        "source_count": counts.to_numpy()[excluded_mask],
+        "reason": "incomplete_or_irregular_source_minutes",
+    })
+    resampled = resampled.loc[complete]
 
     # Reconstruct integer second timestamps
     resampled["open_time"] = resampled.index.tz_localize(None).astype("datetime64[s]").astype("int64")
     resampled["close_time"] = resampled["open_time"] + target_seconds - 1
 
-    # Check and optionally drop the last candle if incomplete
-    if drop_incomplete_last and len(resampled) > 0:
-        last_open_ts = resampled["open_time"].iloc[-1]
-        raw_last_open_ts = df["open_time"].iloc[-1]
-        # If the latest 1m timestamp is before the candle's end, drop incomplete bar
-        if (last_open_ts + target_seconds - 60) > raw_last_open_ts:
-            resampled = resampled.iloc[:-1]
+    # All partial bins, including the last one, were removed above.
 
     # Organize column ordering
     ordered_cols = [
@@ -96,6 +121,8 @@ def resample_ohlcv(
             ordered_cols.append(col)
 
     resampled = resampled.reset_index(drop=True)[ordered_cols]
+    if return_excluded:
+        return resampled, excluded.reset_index(drop=True)
     return resampled
 
 

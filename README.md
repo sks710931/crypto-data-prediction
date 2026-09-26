@@ -2,6 +2,8 @@
 
 An end-to-end, high-performance historical market data pipeline to download, merge, normalize, audit, resample, and compute technical indicators on cryptocurrency candlestick (kline) data from [Binance Vision](https://data.binance.vision) into optimized Parquet feature stores for quantitative trading and machine learning model training.
 
+See [BTCUSDT_5m_AUDIT.md](BTCUSDT_5m_AUDIT.md) for the verified 2017–2026 BTCUSDT 5m data audit and remaining limitations.
+
 ---
 
 ## Table of Contents
@@ -16,7 +18,7 @@ An end-to-end, high-performance historical market data pipeline to download, mer
   - [Step 3.3: Multi-Timeframe Resampling (`src/resampling.py`)](#step-33-multi-timeframe-resampling-srcresamplingpy)
   - [Step 3.4: Technical Indicators Engine (`src/indicators.py`)](#step-34-technical-indicators-engine-srcindicatorspy)
   - [Orchestrator Options & Usage](#orchestrator-options--usage)
-- [Feature Store Schema (64 Columns)](#feature-store-schema-64-columns)
+- [Feature Store Schema (65 Columns for 5m)](#feature-store-schema-65-columns-for-5m)
 - [Git & Data Handling](#git--data-handling)
 
 ---
@@ -30,7 +32,7 @@ This repository provides a modular, production-ready pipeline designed to prepar
 3. **`main.py` (Orchestrator)**:
    * **Converts CSV to Parquet**: Achieves ~2.5x disk compression and sub-second load times via PyArrow.
    * **Audits Data Quality**: Checks for nulls, price anomalies ($H \ge L, H \ge O, H \ge C$), volume violations, and exchange downtime gaps.
-   * **Multi-Timeframe Resampling**: Aggregates 1m base candles into **5m** (primary prediction base), **15m** (short-term trend), and **1h** (macro regime) timeframes with strict lookahead prevention.
+   * **5m source selection**: Uses complete official Binance Vision 5m monthly archives when present. Otherwise, resamples only complete, clock-aligned 1m bins. Source exclusions are recorded in a quality JSON file.
    * **Computes 53 Technical Indicators**: Vectorised calculations across **Trend**, **Momentum**, **Volatility**, and **Volume** families.
 
 ---
@@ -52,21 +54,25 @@ crypto-data-prediction/
 │   ├── validation.py            # Comprehensive data integrity & gap audit
 │   ├── storage.py               # High-speed PyArrow CSV <-> Parquet I/O
 │   ├── resampling.py            # Financial OHLCV multi-timeframe resampling
-│   └── indicators.py            # 53 technical indicators & derived features
+│   ├── indicators.py            # 53 technical indicators & derived features
+│   └── training_readiness.py    # Point-in-time label and split audit
 │
 ├── raw/                         # (Ignored by Git) Downloaded monthly zip archives
 │   └── BTCUSDT/
 │       ├── BTCUSDT-1m-2017-08.zip
 │       └── ...
 │
-└── processed/                   # (Ignored by Git) Merged CSV & binary Parquet datasets
-    ├── BTCUSDT.csv              # Full merged 1m CSV
-    └── parquet/                 # Fast-loading Parquet files
-        ├── BTCUSDT_1m.parquet   # ~4.7M rows (Snappy compressed)
-        ├── BTCUSDT_5m.parquet   # Primary prediction timeframe (~942k rows)
-        ├── BTCUSDT_15m.parquet  # Intermediate trend context (~314k rows)
-        ├── BTCUSDT_1h.parquet   # Broader regime context (~78.5k rows)
-        └── BTCUSDT_5m_features.parquet # Feature store with 53 indicators (64 columns)
+├── processed/                   # (Ignored by Git) Merged and intermediate market data
+│   ├── BTCUSDT.csv              # Full merged 1m CSV
+│   └── parquet/
+│       ├── BTCUSDT_1m.parquet   # Source 1m candles
+│       └── BTCUSDT_5m.parquet   # Valid observed 5m candles
+└── train-data/                  # (Ignored by Git) Training features and audit artifacts
+    ├── BTCUSDT_5m_features.parquet
+    ├── BTCUSDT_5m_training_rows.parquet
+    ├── BTCUSDT_5m_training_readiness.md
+    ├── BTCUSDT_5m_snapshot.json
+    └── snapshots/              # Frozen, content-addressed feature and row files
 ```
 
 ---
@@ -113,6 +119,15 @@ Extracts CSVs from `raw/{pair}/*.zip`, normalizes timestamps to Unix epoch secon
 python merger.py --pair BTCUSDT
 ```
 
+To publish a **uniform, synthetic clock-grid view** and a per-gap filling report, run:
+
+```bash
+python merger.py --pair BTCUSDT --interval 1m --fill-missing --clock-grid --output-file processed/BTCUSDT_1m_grid.csv
+python merger.py --pair BTCUSDT --interval 5m --fill-missing --clock-grid --output-file processed/BTCUSDT_5m_grid.csv
+```
+
+Every generated candle has `is_synthetic=1`, flat OHLC equal to the last observed close, and zero volume and trades. The report is written beside the CSV as `.fill_report.json`. Clock-shifted or incomplete exchange bars are preserved in `.excluded_source.csv`. These grid files give uniform timestamps for calendar analysis; synthetic rows are **not observed market data** and must not be used as training labels or indicator continuity. The observed-only 5m feature pipeline still uses the direct archives and remains gap-aware. See [BTCUSDT_FILLING_REPORT.md](BTCUSDT_FILLING_REPORT.md) for actual counts and limitations.
+
 ---
 
 ## 3. Pipeline Orchestrator (`main.py`)
@@ -120,7 +135,7 @@ python merger.py --pair BTCUSDT
 The orchestrator transforms raw merged data into validated Parquet datasets and generates a complete technical indicator feature store:
 
 ```bash
-python main.py --pair BTCUSDT
+python main.py --pair BTCUSDT --interval 5m
 ```
 
 ### Step 3.1: Parquet Conversion (`src/storage.py`)
@@ -132,14 +147,14 @@ python main.py --pair BTCUSDT
 * **Price Sanity:** Verifies $\text{High} \ge \max(\text{Open}, \text{Close}, \text{Low})$ and $\text{Low} \le \min(\text{Open}, \text{Close}, \text{High})$ and all prices $> 0$.
 * **Volume Sanity:** Verifies $\text{Volume} \ge 0$ and $\text{Taker Buy Volume} \le \text{Total Volume}$.
 * **Chronological Ordering:** Verifies strictly monotonic timestamps ($t_{i} > t_{i-1}$) with zero duplicates.
-* **Exchange Gap Report:** Detects and ranks exchange maintenance windows and downtime.
+* **Gap Report:** Detects and ranks unavailable clock intervals without attributing their cause.
 
 ### Step 3.3: Multi-Timeframe Resampling (`src/resampling.py`)
 Resamples 1-minute base data into higher timeframes using proper financial aggregation:
 * $\text{Open} = \text{first}, \quad \text{High} = \max, \quad \text{Low} = \min, \quad \text{Close} = \text{last}$
 * $\text{Volume} = \sum, \quad \text{Quote Volume} = \sum, \quad \text{Trades} = \sum, \quad \text{Taker Buy Volume} = \sum$
 * Left-closed, left-labeled $[T, T + \Delta t)$ intervals.
-* Drops trailing incomplete candles at the end of the dataset to prevent lookahead bias.
+* Rejects incomplete bins anywhere in history, including bins with shifted or truncated 1m source candles.
 
 ### Step 3.4: Technical Indicators Engine (`src/indicators.py`)
 Computes **53 indicators and scale-invariant derived features** across 4 categories:
@@ -183,10 +198,10 @@ Computes **53 indicators and scale-invariant derived features** across 4 categor
 ### Orchestrator Options & Usage
 
 ```bash
-# 1. Default run (converts to parquet, validates, no resampling, computes indicators on 1m)
+# 1. Audit 1m directly (stops on BTCUSDT's historical off-grid source bars)
 python main.py --pair BTCUSDT
 
-# 2. Resample at start and compute features on target timeframe (e.g., 5m)
+# 2. Use complete official 5m archives when available; otherwise strict resampling
 python main.py --pair BTCUSDT --interval 5m
 
 # 3. Higher timeframes (e.g., 15m, 1h)
@@ -196,15 +211,25 @@ python main.py --pair BTCUSDT --interval 15m
 | Argument | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
 | `--pair` | `str` | `BTCUSDT` | Trading pair symbol (e.g. `BTCUSDT`, `ETHUSDT`) |
-| `--interval` | `str` | `1m` | Candle interval (e.g. `1m`, `5m`, `15m`, `1h`). If not `1m`, resamples at start and runs all operations on that interval. |
+| `--interval` | `str` | `1m` | Candle interval (e.g. `1m`, `5m`, `15m`, `1h`). |
+| `--source` | `auto`, `1m`, `5m` | `auto` | 5m source selection; direct 5m requires complete monthly archives. |
+| `--train-end` | UTC date | `2026-03-01` | First day of validation; the preceding next-candle label is embargoed. |
+| `--validation-end` | UTC date | `2026-06-01` | First day of the untouched test period. |
+| `--color` | `auto`, `always`, `never` | `auto` | Console colors; `always` overrides `NO_COLOR`. |
 
-*Note: Initial warmup rows (200 bars for EMA 200) are automatically dropped by default from the final feature store.*
+For the primary 5m dataset, download official 5m archives with `python download.py --pair BTCUSDT --interval 5m --start 2017-08 --end 2026-08`. `--source auto` (the default) uses them only when every month covering the local 1m range is present. Use `--source 1m` to force strict 1m resampling, or `--source 5m` to require direct archives. The pipeline never fills gaps with synthetic candles. It drops and counts the first 200 rows of **each continuous segment** so rolling indicators and EMA state cannot cross a gap. `train-data/BTCUSDT_5m_quality.json` records source exclusions, gaps, warmup exclusions, and unavailable labels.
+
+Each retained 5m row has a nullable `target_next_up`: 1 when the **next contiguous 5m candle** closes above its open, 0 when it closes below, and null for a gap, the dataset end, or a flat next candle. Row T's features are available when candle T closes. Exclude `target_next_up` from the XGBoost feature matrix, select only rows with a non-null target for supervised training, and use chronological validation splits.
+
+The sixth pipeline stage produces a training-readiness report in `train-data/BTCUSDT_5m_training_readiness.md` and JSON. It independently checks every target by timestamp, checks three causal feature prefixes, profiles each year and split, declares a fixed 62-column input whitelist, and records row-level inclusion or exclusion in `BTCUSDT_5m_training_rows.parquet`. It also records SHA-256 hashes of source, code, and output files in `BTCUSDT_5m_snapshot.json` and keeps content-addressed copies of the feature data and row ledger in `train-data/snapshots/`. Training uses no feature scaling or imputation. The report computes a training-prevalence baseline on validation and reserves test metrics for final model evaluation. This is a probability-forecasting workflow; trading costs and rules are outside its scope.
+The readiness status can pass with modeling warnings. In particular, the report compares later-period feature distributions with the training period and flags substantial drift; this does not change or drop the existing feature definitions.
+The default split trains through February 2026, validates on March-May 2026, and reserves June-August 2026 for one final test. After a model has passed that test, a separate final fit can include all observations through August 2026; its performance must then be monitored on newly arriving candles.
 
 ---
 
-## Feature Store Schema (64 Columns)
+## Feature Store Schema (65 Columns for 5m)
 
-The output Parquet feature store (`processed/parquet/BTCUSDT_5m_features.parquet`) contains:
+The output Parquet feature store (`train-data/BTCUSDT_5m_features.parquet`) contains:
 
 | Category | Columns |
 | :--- | :--- |
@@ -213,6 +238,9 @@ The output Parquet feature store (`processed/parquet/BTCUSDT_5m_features.parquet
 | **Momentum** (10) | `rsi_7`, `rsi_14`, `rsi_14_change`, `roc_5`, `roc_10`, `roc_20`, `stochrsi_k_14_3_3`, `stochrsi_d_14_3_3`, `cci_20`, `williams_r_14` |
 | **Volatility** (15) | `atr_14`, `natr_14`, `bb_lower_20_2`, `bb_mid_20_2`, `bb_upper_20_2`, `bb_bandwidth_20_2`, `bb_pct_b_20_2`, `volatility_returns_5`, `volatility_returns_15`, `volatility_returns_30`, `volatility_returns_60`, `parkinson_vol_20`, `keltner_lower_20_2`, `keltner_mid_20_2`, `keltner_upper_20_2` |
 | **Volume** (9) | `rvol_20`, `volume_zscore_20`, `obv`, `mfi_14`, `cmf_20`, `vwap_20`, `dist_vwap_20_pct`, `vwap_60`, `dist_vwap_60_pct` |
+| **Target** (1) | `target_next_up` (nullable 0/1, never an input feature) |
+
+Williams %R is null when its 14-candle high-low range is zero; no arbitrary oscillator value is inserted. Volume ratios and rolling VWAP remain null when their denominator is zero. Validation separates these mathematical exceptions from critical missing values and reports unavailable clock slots without assuming the cause.
 
 ---
 
@@ -220,7 +248,7 @@ The output Parquet feature store (`processed/parquet/BTCUSDT_5m_features.parquet
 
 The `.gitignore` is configured to prevent committing large data files and runtime artifacts:
 - Raw ZIP files (`raw/`, `*.zip`)
-- Processed CSV and Parquet files (`processed/`, `*.csv`, `*.parquet`)
+- Processed and training data (`processed/`, `train-data/`, `*.csv`, `*.parquet`)
 - Virtual environments (`.venv/`, `venv/`)
 - Python bytecode and cache (`__pycache__/`)
 

@@ -66,12 +66,14 @@ def csv_to_parquet(
 
     # Write Parquet with compression
     write_start = time.time()
+    temp_path = parquet_path.with_suffix(".parquet.tmp")
     pq.write_table(
         table,
-        parquet_path,
+        temp_path,
         compression=compression,
         use_dictionary=True,
     )
+    temp_path.replace(parquet_path)
     write_elapsed = time.time() - write_start
 
     csv_mb = csv_path.stat().st_size / (1024 * 1024)

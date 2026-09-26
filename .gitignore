@@ -14,6 +14,7 @@ ENV/
 # Data folders (raw zip files and large processed CSVs)
 raw/
 processed/
+train-data/
 *.zip
 *.csv
 *.parquet

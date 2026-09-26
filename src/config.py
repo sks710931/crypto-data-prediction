@@ -8,10 +8,12 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent
 PROCESSED_DIR = BASE_DIR / "processed"
 PARQUET_DIR = PROCESSED_DIR / "parquet"
+TRAIN_DATA_DIR = BASE_DIR / "train-data"
 
 # Ensure directories exist
 PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 PARQUET_DIR.mkdir(parents=True, exist_ok=True)
+TRAIN_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Standard Binance 1m Kline Columns
 RAW_COLUMNS = [
@@ -70,3 +72,20 @@ TIMEFRAME_SECONDS = {
     "4h": 14400,
     "1d": 86400,
 }
+
+# Contract for the engineered feature store. The target is checked separately.
+FEATURE_COLUMNS = [
+    "ema_9", "ema_21", "ema_50", "ema_200", "sma_20", "sma_50",
+    "price_dist_ema21_pct", "ema9_ema21_spread_pct", "ema21_slope_pct",
+    "macd", "macd_hist", "macd_signal", "macd_hist_change",
+    "adx_14", "plus_di_14", "minus_di_14", "di_diff_14",
+    "supertrend_10_3", "supertrend_dir_10_3",
+    "rsi_7", "rsi_14", "rsi_14_change", "roc_5", "roc_10", "roc_20",
+    "stochrsi_k_14_3_3", "stochrsi_d_14_3_3", "cci_20", "williams_r_14",
+    "atr_14", "natr_14", "bb_lower_20_2", "bb_mid_20_2", "bb_upper_20_2",
+    "bb_bandwidth_20_2", "bb_pct_b_20_2", "volatility_returns_5",
+    "volatility_returns_15", "volatility_returns_30", "volatility_returns_60",
+    "parkinson_vol_20", "keltner_lower_20_2", "keltner_mid_20_2", "keltner_upper_20_2",
+    "rvol_20", "volume_zscore_20", "obv", "mfi_14", "cmf_20",
+    "vwap_20", "dist_vwap_20_pct", "vwap_60", "dist_vwap_60_pct",
+]

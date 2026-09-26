@@ -11,7 +11,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from .config import RAW_COLUMNS, TIMEFRAME_SECONDS
+from .config import FEATURE_COLUMNS, TIMEFRAME_SECONDS
 
 
 @dataclass
@@ -24,6 +24,11 @@ class ValidationReport:
     volume_errors: int = 0
     timestamp_duplicates: int = 0
     out_of_order_errors: int = 0
+    alignment_errors: int = 0
+    close_time_errors: int = 0
+    interval_errors: int = 0
+    inf_counts: dict[str, int] = field(default_factory=dict)
+    synthetic_rows: int = 0
     gaps: list[dict[str, Any]] = field(default_factory=list)
     total_missing_candles: int = 0
     is_valid: bool = True
@@ -40,13 +45,18 @@ class ValidationReport:
             f" Volume Errors:        {self.volume_errors:,}",
             f" Duplicate Timestamps: {self.timestamp_duplicates:,}",
             f" Out of Order Errors:  {self.out_of_order_errors:,}",
+            f" Alignment Errors:     {self.alignment_errors:,}",
+            f" Candle Duration Errors:{self.close_time_errors:,}",
+            f" Short Interval Errors: {self.interval_errors:,}",
+            f" Infinite Values:       {sum(self.inf_counts.values()):,}",
+            f" Synthetic Rows:        {self.synthetic_rows:,}",
             f" Gaps Detected:        {len(self.gaps):,}",
-            f" Total Missing Candles:{self.total_missing_candles:,}",
-            f" Overall Status:       {'PASSED [OK]' if self.is_valid else 'FAILED [WARNINGS FOUND]'}",
+            f" Unavailable Clock Slots:{self.total_missing_candles:,}",
+            f" Overall Status:       {'PASSED (historical gaps documented)' if self.is_valid and self.gaps else 'PASSED [OK]' if self.is_valid else 'FAILED [CRITICAL ERRORS]'}",
             "=" * 68,
         ]
         if self.gaps:
-            lines.append("\nTop 5 Largest Detected Gaps (Exchange Downtime / Maintenance):")
+            lines.append("\nTop 5 Unavailable Clock Intervals (cause not inferred):")
             lines.append(f"{'#':<4} {'Start UTC':<22} {'End UTC':<22} {'Missing':<10} {'Duration'}")
             lines.append("-" * 68)
             sorted_gaps = sorted(self.gaps, key=lambda g: g["missing_candles"], reverse=True)
@@ -90,12 +100,25 @@ def validate_ohlcv(
     if report.total_rows == 0:
         report.is_valid = False
         return report
+    required = {*price_cols, volume_col, time_col, "close_time"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"Missing required OHLCV columns: {sorted(missing)}")
 
     # 1. Null / NaN Counts
     null_dict = df.isnull().sum().to_dict()
     report.null_counts = {k: int(v) for k, v in null_dict.items() if v > 0}
     if sum(report.null_counts.values()) > 0:
         report.is_valid = False
+    numeric = df.select_dtypes(include=[np.number])
+    report.inf_counts = {col: int(np.isinf(numeric[col].to_numpy(dtype="float64", na_value=np.nan)).sum()) for col in numeric}
+    report.inf_counts = {col: count for col, count in report.inf_counts.items() if count}
+    if report.inf_counts:
+        report.is_valid = False
+    if "is_synthetic" in df.columns:
+        report.synthetic_rows = int(df["is_synthetic"].astype(bool).sum())
+        if report.synthetic_rows:
+            report.is_valid = False
 
     # Extract columns
     o_col, h_col, l_col, c_col = price_cols
@@ -133,8 +156,16 @@ def validate_ohlcv(
     if "taker_buy_base_asset_volume" in df.columns:
         taker_vol = df["taker_buy_base_asset_volume"].to_numpy()
         # tolerance for floating point rounding issues
-        excessive_taker = taker_vol > (volumes + 1e-5)
+        excessive_taker = (taker_vol < 0) | (taker_vol > (volumes + 1e-5))
         report.volume_errors += int(np.sum(excessive_taker))
+    if "quote_asset_volume" in df.columns:
+        quote = df.quote_asset_volume.to_numpy()
+        report.volume_errors += int(np.sum(quote < 0))
+        if "taker_buy_quote_asset_volume" in df.columns:
+            taker_quote = df.taker_buy_quote_asset_volume.to_numpy()
+            report.volume_errors += int(np.sum((taker_quote < 0) | (taker_quote > quote + 1e-5)))
+    if "number_of_trades" in df.columns:
+        report.volume_errors += int(np.sum(df.number_of_trades.to_numpy() < 0))
 
     if report.volume_errors > 0:
         report.is_valid = False
@@ -142,7 +173,9 @@ def validate_ohlcv(
     # 4. Timestamp Continuity & Gaps
     sample_ts = int(times[0])
     is_ms = sample_ts >= 1_000_000_000_000
-    step_sec = TIMEFRAME_SECONDS.get(interval, 60)
+    if interval not in TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    step_sec = TIMEFRAME_SECONDS[interval]
     expected_step = step_sec * 1000 if is_ms else step_sec
     time_diffs = np.diff(times)
 
@@ -150,8 +183,12 @@ def validate_ohlcv(
     out_of_order = int(np.sum(time_diffs < 0))
     report.timestamp_duplicates = duplicates
     report.out_of_order_errors = out_of_order
+    report.alignment_errors = int(np.sum(times % expected_step != 0))
+    report.interval_errors = int(np.sum((time_diffs > 0) & (time_diffs < expected_step)))
+    if "close_time" in df.columns:
+        report.close_time_errors = int(np.sum(df.close_time.to_numpy() - times != expected_step - 1))
 
-    if duplicates > 0 or out_of_order > 0:
+    if duplicates > 0 or out_of_order > 0 or report.alignment_errors or report.close_time_errors or report.interval_errors:
         report.is_valid = False
 
     # Gap detection
@@ -192,6 +229,16 @@ class FeatureValidationReport:
     total_infs: int = 0
     indicator_errors: dict[str, int] = field(default_factory=dict)
     total_indicator_errors: int = 0
+    critical_null_counts: dict[str, int] = field(default_factory=dict)
+    acceptable_null_counts: dict[str, int] = field(default_factory=dict)
+    alignment_errors: int = 0
+    close_time_errors: int = 0
+    interval_errors: int = 0
+    unavailable_labels: int = 0
+    feature_discontinuities: int = 0
+    warmup_rows_excluded: int = 0
+    missing_feature_columns: list[str] = field(default_factory=list)
+    duplicate_columns: int = 0
     is_valid: bool = True
 
     def summary(self) -> str:
@@ -202,17 +249,26 @@ class FeatureValidationReport:
             f" Total Candles:          {self.total_rows:,}",
             f" Total Columns:          {self.total_columns:,}",
             f" Date Range:             {self.start_time_utc} to {self.end_time_utc}",
-            f" Missing Candles / Gaps: {self.total_missing_candles:,} ({len(self.gaps):,} gap(s))",
+            f" Unavailable Clock Slots: {self.total_missing_candles:,} ({len(self.gaps):,} source gap(s))",
+            f" Feature Discontinuities:{self.feature_discontinuities:,}",
+            f" Excluded Warmup Rows:   {self.warmup_rows_excluded:,}",
             f" Duplicate Timestamps:   {self.timestamp_duplicates:,}",
             f" Out of Order Errors:    {self.out_of_order_errors:,}",
-            f" Total NaN Errors:       {self.total_nans:,}",
+            f" Alignment Errors:       {self.alignment_errors:,}",
+            f" Candle Duration Errors: {self.close_time_errors:,}",
+            f" Short Interval Errors:  {self.interval_errors:,}",
+            f" Critical NaN Errors:    {sum(self.critical_null_counts.values()):,}",
+            f" Defined-Value NaNs:     {sum(self.acceptable_null_counts.values()):,}",
+            f" Unavailable Labels:     {self.unavailable_labels:,}",
             f" Total Inf Errors:       {self.total_infs:,}",
             f" Indicator Anomalies:    {self.total_indicator_errors:,}",
-            f" Overall Status:         {'PASSED [OK]' if self.is_valid else 'FAILED [WARNINGS FOUND]'}",
+            f" Missing Feature Columns:{len(self.missing_feature_columns):,}",
+            f" Duplicate Columns:     {self.duplicate_columns:,}",
+            f" Overall Status:         {'PASSED (historical gaps documented)' if self.is_valid and self.gaps else 'PASSED [OK]' if self.is_valid else 'FAILED [CRITICAL ERRORS]'}",
             "=" * 68,
         ]
         if self.null_counts:
-            lines.append("\nColumns with NaN Values:")
+            lines.append("\nColumns with NaN Values (critical / mathematically undefined / unavailable target):")
             for col, count in sorted(self.null_counts.items(), key=lambda x: x[1], reverse=True)[:10]:
                 pct = (count / self.total_rows) * 100 if self.total_rows > 0 else 0
                 lines.append(f"  - {col}: {count:,} ({pct:.2f}%)")
@@ -226,7 +282,7 @@ class FeatureValidationReport:
             for rule, count in sorted(self.indicator_errors.items(), key=lambda x: x[1], reverse=True):
                 lines.append(f"  - {rule}: {count:,} violations")
         if self.gaps:
-            lines.append("\nTop 5 Detected Gaps (Missing Candles):")
+            lines.append("\nTop 5 Unavailable Clock Intervals (source data and exclusions):")
             lines.append(f"{'#':<4} {'Start UTC':<22} {'End UTC':<22} {'Missing':<10} {'Duration'}")
             lines.append("-" * 68)
             sorted_gaps = sorted(self.gaps, key=lambda g: g["missing_candles"], reverse=True)
@@ -243,6 +299,8 @@ def validate_features(
     time_col: str = "open_time",
     price_col: str = "close",
     tolerance: float = 1e-4,
+    source_report: ValidationReport | None = None,
+    warmup_rows_excluded: int = 0,
 ) -> FeatureValidationReport:
     """
     Validates feature-engineered market dataset across 4 critical pillars:
@@ -254,6 +312,11 @@ def validate_features(
     report = FeatureValidationReport()
     report.total_rows = len(df)
     report.total_columns = len(df.columns)
+    report.warmup_rows_excluded = warmup_rows_excluded
+    report.missing_feature_columns = sorted(set(FEATURE_COLUMNS + ["target_next_up"]) - set(df.columns))
+    report.duplicate_columns = int(df.columns.duplicated().sum())
+    if report.missing_feature_columns or report.duplicate_columns:
+        report.is_valid = False
 
     if report.total_rows == 0:
         report.is_valid = False
@@ -268,17 +331,24 @@ def validate_features(
 
     sample_ts = int(times[0])
     is_ms = sample_ts >= 1_000_000_000_000
-    step_sec = TIMEFRAME_SECONDS.get(interval, 60)
+    if interval not in TIMEFRAME_SECONDS:
+        raise ValueError(f"Unsupported interval: {interval}")
+    step_sec = TIMEFRAME_SECONDS[interval]
     expected_step = step_sec * 1000 if is_ms else step_sec
 
     time_diffs = np.diff(times)
     report.timestamp_duplicates = int(np.sum(time_diffs == 0))
     report.out_of_order_errors = int(np.sum(time_diffs < 0))
+    report.alignment_errors = int(np.sum(times % expected_step != 0))
+    report.interval_errors = int(np.sum((time_diffs > 0) & (time_diffs < expected_step)))
+    if "close_time" in df.columns:
+        report.close_time_errors = int(np.sum(df.close_time.to_numpy() - times != expected_step - 1))
 
-    if report.timestamp_duplicates > 0 or report.out_of_order_errors > 0:
+    if report.timestamp_duplicates > 0 or report.out_of_order_errors > 0 or report.alignment_errors or report.close_time_errors or report.interval_errors:
         report.is_valid = False
 
     gap_indices = np.where(time_diffs > expected_step)[0]
+    report.feature_discontinuities = len(gap_indices)
     for idx in gap_indices:
         t_start = int(times[idx]) + expected_step
         t_end = int(times[idx + 1]) - expected_step
@@ -295,6 +365,9 @@ def validate_features(
             "duration_sec": gap_sec,
         })
         report.total_missing_candles += missing_count
+    if source_report is not None:
+        report.gaps = source_report.gaps.copy()
+        report.total_missing_candles = source_report.total_missing_candles
 
     # -------------------------------------------------------------
     # 3. NaNs and Infinite Values
@@ -303,12 +376,41 @@ def validate_features(
     report.null_counts = {k: int(v) for k, v in null_dict.items() if v > 0}
     report.total_nans = sum(report.null_counts.values())
 
+    if "target_next_up" in df:
+        report.unavailable_labels = int(df.target_next_up.isna().sum())
+    segments = (df[time_col].diff() != expected_step).cumsum()
+
+    def rolling_denominator(column: str, window: int, op: str) -> pd.Series:
+        return df.groupby(segments)[column].transform(lambda s: getattr(s.rolling(window), op)())
+
+    for col, count in report.null_counts.items():
+        if col == "target_next_up":
+            continue
+        if col == "williams_r_14":
+            # %R is undefined when its 14-bar high-low denominator is zero.
+            highest = rolling_denominator("high", 14, "max")
+            lowest = rolling_denominator("low", 14, "min")
+            acceptable = df[col].isna() & (highest == lowest)
+        elif col == "rvol_20":
+            acceptable = df[col].isna() & (rolling_denominator("volume", 20, "mean") == 0)
+        elif col == "volume_zscore_20":
+            acceptable = df[col].isna() & (rolling_denominator("volume", 20, "std") == 0)
+        elif col in {"vwap_20", "dist_vwap_20_pct", "vwap_60", "dist_vwap_60_pct"}:
+            window = 20 if "20" in col else 60
+            acceptable = df[col].isna() & (rolling_denominator("volume", window, "sum") == 0)
+        else:
+            acceptable = pd.Series(False, index=df.index)
+        if acceptable.any():
+            report.acceptable_null_counts[col] = int(acceptable.sum())
+        if count > int(acceptable.sum()):
+            report.critical_null_counts[col] = count - int(acceptable.sum())
+
     num_df = df.select_dtypes(include=[np.number])
-    inf_dict = np.isinf(num_df).sum().to_dict()
+    inf_dict = {col: int(np.isinf(num_df[col].to_numpy(dtype="float64", na_value=np.nan)).sum()) for col in num_df}
     report.inf_counts = {k: int(v) for k, v in inf_dict.items() if v > 0}
     report.total_infs = sum(report.inf_counts.values())
 
-    if report.total_nans > 0 or report.total_infs > 0:
+    if report.critical_null_counts or report.total_infs > 0:
         report.is_valid = False
 
     # -------------------------------------------------------------
@@ -380,11 +482,30 @@ def validate_features(
     if "williams_r_14" in df.columns:
         inv_willr = ((df["williams_r_14"] < -100.01) | (df["williams_r_14"] > 0.01)).sum()
         record_anomaly("williams_r_14_bounds ([-100, 0])", inv_willr)
+        if close is not None:
+            highest = rolling_denominator("high", 14, "max")
+            lowest = rolling_denominator("low", 14, "min")
+            expected = -100 * (highest - close) / (highest - lowest)
+            checked = (highest > lowest) & df["williams_r_14"].notna()
+            record_anomaly("williams_r_14_formula", ((df["williams_r_14"] - expected).abs() > tolerance)[checked].sum())
+
+    if close is not None:
+        for period in (5, 10, 20):
+            name = f"roc_{period}"
+            if name in df.columns:
+                previous = df.groupby(segments)[price_col].shift(period)
+                expected = (close / previous - 1) * 100
+                checked = previous.notna() & df[name].notna()
+                record_anomaly(f"{name}_formula", ((df[name] - expected).abs() > tolerance)[checked].sum())
+
+    if "target_next_up" in df.columns:
+        inv_target = (~df["target_next_up"].dropna().isin([0, 1])).sum()
+        record_anomaly("target_next_up_binary", inv_target)
 
     # F. Volatility Indicators
     if "atr_14" in df.columns:
-        inv_atr = (df["atr_14"] <= 0).sum()
-        record_anomaly("atr_14_positive", inv_atr)
+        inv_atr = (df["atr_14"] < 0).sum()
+        record_anomaly("atr_14_non_negative", inv_atr)
         if close is not None and "natr_14" in df.columns:
             expected_natr = (df["atr_14"] / close) * 100.0
             inv = (np.abs(df["natr_14"] - expected_natr) > tolerance).sum()
@@ -398,8 +519,8 @@ def validate_features(
         record_anomaly("bb_bands_order (lower <= mid <= upper)", inv_bb_order)
 
     if "bb_bandwidth_20_2" in df.columns:
-        inv_bw = (df["bb_bandwidth_20_2"] <= 0).sum()
-        record_anomaly("bb_bandwidth_positive", inv_bw)
+        inv_bw = (df["bb_bandwidth_20_2"] < 0).sum()
+        record_anomaly("bb_bandwidth_non_negative", inv_bw)
 
     if all(c in df.columns for c in ["keltner_lower_20_2", "keltner_mid_20_2", "keltner_upper_20_2"]):
         inv_kc_order = (
@@ -436,6 +557,13 @@ def validate_features(
                 expected_dist = (close - df[vwap_col]) / df[vwap_col] * 100.0
                 inv = (np.abs(df[dist_col] - expected_dist) > tolerance).sum()
                 record_anomaly(f"{dist_col}_formula", inv)
+            if all(c in df.columns for c in ("high", "low", "close", "volume")):
+                typical_volume = (df.high + df.low + df.close) / 3 * df.volume
+                pv_sum = typical_volume.groupby(segments).transform(lambda s: s.rolling(v_win).sum())
+                volume_sum = df.volume.groupby(segments).transform(lambda s: s.rolling(v_win).sum())
+                expected_vwap = pv_sum / volume_sum.where(volume_sum != 0)
+                checked = expected_vwap.notna() & df[vwap_col].notna()
+                record_anomaly(f"{vwap_col}_formula", ((df[vwap_col] - expected_vwap).abs() > tolerance)[checked].sum())
 
     return report
 
